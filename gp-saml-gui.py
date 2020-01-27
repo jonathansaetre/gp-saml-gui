@@ -1,23 +1,21 @@
-#!/usr/bin/env python3
-
 import gi
 import argparse
 import pprint
-import urllib
 import requests
 import xml.etree.ElementTree as ET
-import ssl
+import os
 
-from operator import setitem
-from os import path
-from shlex import quote
 from sys import stderr
 from binascii import a2b_base64, b2a_base64
-from urllib.parse import urlparse
 
 gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+
 gi.require_version('WebKit2', '4.0')
-from gi.repository import Gtk, WebKit2, GLib
+from gi.repository import WebKit2
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class SAMLLoginView:
     def __init__(self, uri, html=None, verbose=False, cookies=None, verify=True):
@@ -25,7 +23,6 @@ class SAMLLoginView:
 
         # API reference: https://lazka.github.io/pgi-docs/#WebKit2-4.0
 
-        self.closed = False
         self.success = False
         self.saml_result = {}
         self.verbose = verbose
@@ -43,7 +40,7 @@ class SAMLLoginView:
         window.add(self.wview)
         window.show_all()
         window.set_title("SAML Login")
-        window.connect('delete-event', self.close)
+        window.connect('delete-event', Gtk.main_quit)
         self.wview.connect('load-changed', self.get_saml_headers)
         self.wview.connect('resource-load-started', self.log_resources)
 
@@ -52,84 +49,41 @@ class SAMLLoginView:
         else:
             self.wview.load_uri(uri)
 
-    def close(self, window, event):
-        self.closed = True
-        Gtk.main_quit()
-
     def log_resources(self, webview, resource, request):
         if self.verbose > 1:
-            print('[REQUEST] %s for resource %s' % (request.get_http_method() or 'Request', resource.get_uri()), file=stderr)
-        if self.verbose > 2:
-            resource.connect('finished', self.log_resource_details, request)
-
-    def log_resource_details(self, resource, request):
-        m = request.get_http_method() or 'Request'
-        uri = resource.get_uri()
-        rs = resource.get_response()
-        h = rs.get_http_headers() if rs else None
-        if h:
-            ct, cl = h.get_content_type(), h.get_content_length()
-            content_type, charset = ct[0], ct.params.get('charset')
-            content_details = '%d bytes of %s%s for ' % (cl, content_type, ('; charset='+charset) if charset else '')
-        print('[RECEIVE] %sresource %s %s' % (content_details if h else '', m, uri), file=stderr)
-
-    def log_resource_text(self, resource, result, content_type, charset=None, show_headers=None):
-        data = resource.get_data_finish(result)
-        content_details = '%d bytes of %s%s for ' % (len(data), content_type, ('; charset='+charset) if charset else '')
-        print('[DATA   ] %sresource %s' % (content_details, resource.get_uri()), file=stderr)
-        if show_headers:
-            for h,v in show_headers.items():
-                print('%s: %s' % (h, v), file=stderr)
-            print(file=stderr)
-        if charset or content_type.startswith('text/'):
-            print(data.decode(charset or 'utf-8'), file=stderr)
+            print('%s for resource %s' % (request.get_http_method() or 'Request', resource.get_uri()), file=stderr)
 
     def get_saml_headers(self, webview, event):
         if event != WebKit2.LoadEvent.FINISHED:
             return
 
         mr = webview.get_main_resource()
-        uri = mr.get_uri()
+        if self.verbose:
+            print("Finished loading %s" % mr.get_uri(), file=stderr)
         rs = mr.get_response()
         h = rs.get_http_headers()
-        if self.verbose:
-            print('[PAGE   ] Finished loading page %s' % uri, file=stderr)
-        if not h:
-            return
-
-        # convert to normal dict
-        d = {}
-        h.foreach(lambda k, v: setitem(d, k, v))
-        # filter to interesting headers
-        fd = {name:v for name, v in d.items() if name.startswith('saml-') or name in ('prelogin-cookie', 'portal-userauthcookie')}
-        if fd and self.verbose:
-            print("[SAML   ] Got SAML result headers: %r" % fd, file=stderr)
-            if self.verbose > 1:
-                # display everything we found
-                ct = h.get_content_type()
-                mr.get_data(None, self.log_resource_text, ct[0], ct.params.get('charset'), d)
-
-        # check if we're done
-        self.saml_result.update(fd, server=urlparse(uri).netloc)
-        GLib.timeout_add(1000, self.check_done)
-
-    def check_done(self):
-        d = self.saml_result
-        if 'saml-username' in d and ('prelogin-cookie' in d or 'portal-userauthcookie' in d):
-            if args.verbose:
-                print("[SAML   ] Got all required SAML headers, done.", file=stderr)
-            self.success = True
-            Gtk.main_quit()
+        if h:
+            l = []
+            def listify(name, value, t=l):
+                if (name.startswith('saml-') or name in ('prelogin-cookie', 'portal-userauthcookie')):
+                    t.append((name, value))
+            h.foreach(listify)
+            d = dict(l)
+            if d and self.verbose:
+                print("Got SAML result headers: %r" % d, file=stderr)
+            d = self.saml_result
+            d.update(dict(l))
+            if 'saml-username' in d and ('prelogin-cookie' in d or 'portal-userauthcookie' in d):
+                #print("Got all required SAML headers, done.", file=stderr)
+                self.success = True
+                Gtk.main_quit()
 
 def parse_args(args = None):
     p = argparse.ArgumentParser()
     p.add_argument('server', help='GlobalProtect server (portal or gateway)')
     p.add_argument('--no-verify', dest='verify', action='store_false', default=True, help='Ignore invalid server certificate')
-    x = p.add_mutually_exclusive_group()
-    x.add_argument('-C', '--cookies', default='~/.gp-saml-gui-cookies',
-                   help='Use and store cookies in this file (instead of default %(default)s)')
-    x.add_argument('-K', '--no-cookies', dest='cookies', action='store_const', const=None,
-                   help="Don't use or store cookies at all")
+    p.add_argument('-C', '--no-cookies', dest='cookies', action='store_const', const=None,
+                   default='~/.gp-saml-gui-cookies', help="Don't use cookies (stored in %(default)s)")
     x = p.add_mutually_exclusive_group()
     x.add_argument('-p','--portal', dest='portal', action='store_true', help='SAML auth to portal')
     x.add_argument('-g','--gateway', dest='portal', action='store_false', help='SAML auth to gateway (default)')
@@ -146,7 +100,7 @@ def parse_args(args = None):
     args.extra = dict(x.split('=', 1) for x in args.extra)
 
     if args.cookies:
-        args.cookies = path.expanduser(args.cookies)
+        args.cookies = os.path.expanduser(args.cookies)
 
     if args.cert and args.key:
         args.cert, args.key = (args.cert, args.key), None
@@ -171,24 +125,7 @@ if __name__ == "__main__":
         sam, uri, html = 'URI', args.server, None
     else:
         endpoint = 'https://{}/{}/prelogin.esp'.format(args.server, ('global-protect' if args.portal else 'ssl-vpn'))
-        if args.verbose:
-            print("Looking for SAML auth tags in response to %s..." % endpoint, file=stderr)
-        try:
-            res = s.post(endpoint, verify=args.verify, data=args.extra)
-        except Exception as ex:
-            rootex = ex
-            while True:
-                if isinstance(rootex, ssl.SSLError):
-                    break
-                elif not rootex.__cause__ and not rootex.__context__:
-                    break
-                rootex = rootex.__cause__ or rootex.__context__
-            if isinstance(rootex, ssl.CertificateError):
-                p.error("SSL certificate error (try --no-verify to ignore): %s" % rootex)
-            elif isinstance(rootex, ssl.SSLError):
-                p.error("SSL error: %s" % rootex)
-            else:
-                raise
+        res = s.post(endpoint, verify=args.verify, data=args.extra)
         xml = ET.fromstring(res.content)
         sam = xml.find('saml-auth-method')
         sr = xml.find('saml-request')
@@ -217,15 +154,11 @@ if __name__ == "__main__":
         print("Got SAML %s, opening browser..." % sam, file=stderr)
     slv = SAMLLoginView(uri, html, verbose=args.verbose, cookies=args.cookies, verify=args.verify)
     Gtk.main()
-    if slv.closed:
-        print("Login window closed by user.", file=stderr)
-        p.exit(1)
     if not slv.success:
-        p.error('''Login window closed without producing SAML cookies.''')
+        p.error('''Login window closed without producing SAML cookie''')
 
     # extract response and convert to OpenConnect command-line
     un = slv.saml_result.get('saml-username')
-    server = slv.saml_result.get('server', args.server)
     for cn in ('prelogin-cookie', 'portal-userauthcookie'):
         cv = slv.saml_result.get(cn)
         if cv:
@@ -233,19 +166,12 @@ if __name__ == "__main__":
     else:
         cn = None
 
-    fullpath = ('/global-protect/getconfig.esp' if args.portal else '/ssl-vpn/login.esp')
-    shortpath = ('portal' if args.portal else 'gateway')
     if args.verbose:
-        print('''\nSAML response converted to OpenConnect command line invocation:\n''', file=stderr)
-        print('''    echo {} |\n        openconnect --protocol=gp --user={} --usergroup={}:{} --passwd-on-stdin {}'''.format(
-            quote(cv), quote(un), quote(shortpath), quote(cn), quote(server)), file=stderr)
+        print('''\n\nSAML response converted to OpenConnect command line invocation:\n''', file=stderr)
+        print('''    echo {!r} |\n        openconnect --protocol=gp --user={!r} --usergroup={}:{} --passwd-on-stdin {}\n'''.format(
+            cv, un, ('portal' if args.portal else 'gateway'), cn, args.server), file=stderr)
 
-        print('''\nSAML response converted to test-globalprotect-login.py invocation:\n''', file=stderr)
-        print('''    test-globalprotect-login.py --user={} -p '' \\\n         https://{}{} {}={}\n'''.format(
-            quote(un), quote(server), quote(fullpath), quote(cn), quote(cv)), file=stderr)
-
-    varvals = {
-        'HOST': quote('https://%s/%s:%s' % (server, shortpath, cn)),
-        'USER': quote(un), 'COOKIE': quote(cv),
-    }
-    print('\n'.join('%s=%s' % pair for pair in varvals.items()))
+    #print("HOST={!r}\nUSER={!r}\nCOOKIE={!r}".format('https://%s/%s:%s' % (args.server, ('portal' if args.portal else 'gateway'), cn), un, cv))
+    print(cv)
+#    with open('vpn_cookie', mode='w') as file:
+#        file.write(cv)
